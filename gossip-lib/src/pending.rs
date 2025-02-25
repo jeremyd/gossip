@@ -10,6 +10,7 @@ use parking_lot::RwLock as PRwLock;
 use parking_lot::RwLockReadGuard as PRwLockReadGuard;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use tracing::{debug, error};
 
 #[derive(Debug, Clone, Hash, PartialEq)]
 pub enum PendingItem {
@@ -72,6 +73,7 @@ fn calculate_pending_hash(vec: &Vec<(PendingItem, u64)>) -> u64 {
     vec.hash(&mut s);
     s.finish()
 }
+
 impl PendingItem {
     fn matches(&self, other: &PendingItem) -> bool {
         match self {
@@ -218,6 +220,7 @@ impl Pending {
     }
 
     pub fn compute_pending(&self) -> Result<(), Error> {
+        debug!("Starting compute_pending");
         let mypubkey = match GLOBALS.identity.public_key() {
             Some(pk) => pk,
             None => return Ok(()), // nothing pending if no identity
@@ -229,17 +232,40 @@ impl Pending {
 
         let mut filter = Filter::new();
         filter.add_author(mypubkey);
+        
+        debug!("Checking relay lists");
         filter.kinds = vec![EventKind::RelayList];
-        let relay_lists = GLOBALS.db().find_events_by_filter(&filter, |_| true)?;
+        let relay_lists = match GLOBALS.db().find_events_by_filter(&filter, |_| true) {
+            Ok(lists) => lists,
+            Err(e) => {
+                error!("Error fetching relay lists: {:?}", e);
+                return Err(e);
+            }
+        };
+        
+        debug!("Checking DM relay lists");
         filter.kinds = vec![EventKind::DmRelayList];
-        let dm_relay_lists = GLOBALS.db().find_events_by_filter(&filter, |_| true)?;
+        let dm_relay_lists = match GLOBALS.db().find_events_by_filter(&filter, |_| true) {
+            Ok(lists) => lists,
+            Err(e) => {
+                error!("Error fetching DM relay lists: {:?}", e);
+                return Err(e);
+            }
+        };
 
         if relay_lists.is_empty() && dm_relay_lists.is_empty() {
             self.insert(PendingItem::RelayListNeverAdvertised);
         } else {
             self.remove(&PendingItem::RelayListNeverAdvertised); // remove if present
 
-            let stored_relay_list = GLOBALS.db().load_effective_public_relay_list()?;
+            let stored_relay_list = match GLOBALS.db().load_effective_public_relay_list() {
+                Ok(list) => list,
+                Err(e) => {
+                    error!("Error loading effective public relay list: {:?}", e);
+                    return Err(e);
+                }
+            };
+
             let event_relay_list = RelayList::from_event(&relay_lists[0]);
 
             let stored_dm_relays = {
@@ -282,7 +308,18 @@ impl Pending {
         }
 
         // Check each person list (if out of sync or more than 30 days ago)
-        for (list, metadata) in GLOBALS.db().get_all_person_list_metadata()?.iter() {
+        debug!("Checking person lists");
+        let person_list_metadata = match GLOBALS.db().get_all_person_list_metadata() {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                error!("Error getting person list metadata: {:?}", e);
+                return Err(e);
+            }
+        };
+        
+        for (list, metadata) in person_list_metadata.iter() {
+            debug!("Processing person list {:?}", list);
+            
             // if never published
             if metadata.event_created_at.0 == 0 {
                 self.insert(PendingItem::PersonListNeverPublished(*list));
@@ -292,8 +329,22 @@ impl Pending {
             }
 
             // If mismatched, should be re-synced
-            let stored_hash = GLOBALS.db().hash_person_list(*list)?;
-            let last_event_hash = crate::people::hash_person_list_event(*list)?;
+            let stored_hash = match GLOBALS.db().hash_person_list(*list) {
+                Ok(hash) => hash,
+                Err(e) => {
+                    error!("Error computing stored hash for person list {:?}: {:?}", list, e);
+                    return Err(e);
+                }
+            };
+            
+            let last_event_hash = match crate::people::hash_person_list_event(*list) {
+                Ok(hash) => hash,
+                Err(e) => {
+                    error!("Error computing event hash for person list {:?}: {:?}", list, e);
+                    return Err(e);
+                }
+            };
+
             if stored_hash != last_event_hash {
                 self.insert(PendingItem::PersonListOutOfSync(*list));
                 continue;
